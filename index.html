@@ -44,6 +44,7 @@ const SPAWN_MS = 110;
 const STEP = 1000 / 60;
 const CAT_BEE = 2, CAT_HIVE = 4;
 const BEE_R = 12;
+const BEE_DENSITY = 0.0015; // heavier bees shove the line harder
 const BUOYANCY = 1.6;     // x gravity, upward, for bodies in water (line floats)
 
 // sprites (assets/game). Missing image -> falls back to shape drawing.
@@ -136,8 +137,7 @@ let level = 0, engine, state, pts, ink, line, dogs, hives, plats, spikes, waters
 
 function load(i) {
   level = i; const L = LEVELS[i];
-  // sleeping: resting line/dogs stop micro-jitter; any bee hit wakes them. More iterations = steadier stacking.
-  engine = Engine.create({enableSleeping: true, positionIterations: 10, velocityIterations: 8});
+  engine = Engine.create({positionIterations: 10, velocityIterations: 8}); // more iterations = steadier stacking
   const rect = ([x, y, w, h, a = 0], o) => Object.assign(Bodies.rectangle(x, y, w, h, {isStatic: true, angle: a, ...o}), {w, h});
   plats = L.plats.map(p => rect(p, {friction: 1}));
   spikes = (L.spikes || []).map(p => rect(p, {label: 'spike'}));
@@ -232,7 +232,7 @@ function spawn(now) {
   if (state !== 'play' || spawned >= L.bees || now - lastSpawn < SPAWN_MS) return;
   const h = hives[spawned % hives.length];
   const b = Bodies.circle(h.position.x + (Math.random() - .5) * 20, h.position.y + (Math.random() - .5) * 20, BEE_R, {
-    label: 'bee', sleepThreshold: Infinity, density: 0.0004, frictionAir: 0.02, restitution: 0.6,
+    label: 'bee', density: BEE_DENSITY, frictionAir: 0.02, restitution: 0.6,
     collisionFilter: {category: CAT_BEE, mask: 0xFFFFFFFF ^ CAT_HIVE},
   });
   b.phase = Math.random() * Math.PI * 2;
@@ -309,7 +309,7 @@ function addPoint(p) {
   pts.push(q); ink -= moved;
 }
 
-// Ramer-Douglas-Peucker: fewer, longer physics segments = a line that rests still instead of jittering
+// Ramer-Douglas-Peucker: fewer, longer physics segments = a line that rests still instead of jittering (measured: 0 drift at rest)
 function simplify(p, eps) {
   if (p.length < 3) return p;
   const a = p[0], b = p[p.length - 1], ab = Vector.sub(b, a), len = Vector.magnitude(ab) || 1;
@@ -343,7 +343,7 @@ cv.onpointerup = cv.onpointercancel = () => {
     const a = pts[i - 1], b = pts[i];
     parts.push(Bodies.rectangle((a.x + b.x) / 2, (a.y + b.y) / 2, Vector.magnitude(Vector.sub(b, a)), LINE_W, {angle: Math.atan2(b.y - a.y, b.x - a.x)}));
   }
-  line = Body.create({parts, friction: 1, frictionStatic: 2, frictionAir: 0.01, restitution: 0, density: 0.002});
+  line = Body.create({parts, friction: 0.9, frictionAir: 0.01, restitution: 0});
   line.local = pts.map(p => Vector.sub(p, line.position));
   Composite.add(engine.world, line);
   state = 'play'; tStart = performance.now();
