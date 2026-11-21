@@ -1,0 +1,470 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>Buzz Off</title>
+<style>
+html,body{margin:0;height:100%;background:#9cc9e6;overflow:hidden;font-family:system-ui,sans-serif;touch-action:none;user-select:none}
+#wrap{height:100%;display:flex;align-items:center;justify-content:center}
+canvas{background:linear-gradient(#bfe3ff,#f2faff);border-radius:12px;box-shadow:0 4px 24px #0003;touch-action:none}
+.overlay{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:#0004}
+#box{width:min(84vw,420px);aspect-ratio:1.4;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;background:url(assets/game/panel.png) center/100% 100% no-repeat}
+h1{margin:0;color:#7a5240;font-size:40px}
+#stars img{width:52px;margin:0 2px}
+.row{display:flex;gap:10px}
+button{font:800 20px system-ui;color:#7a5240;padding:12px 30px;border:0;cursor:pointer;background:#ffd970 url(assets/game/button.png) center/100% 100% no-repeat;border-radius:999px}
+#top{position:fixed;top:12px;left:12px;display:flex;gap:8px}
+#top button{padding:8px 16px}
+#mbox{width:min(92vw,520px);padding:34px 30px 30px;box-sizing:border-box;background:url(assets/game/panel.png) center/100% 100% no-repeat;text-align:center}
+#grid{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-top:12px}
+#grid button{padding:8px 0 4px;font-size:18px;border-radius:16px;display:flex;flex-direction:column;align-items:center}
+#grid button:disabled{filter:grayscale(1) opacity(.6);cursor:default}
+#grid img{height:14px}
+#grid .lock{height:22px}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<div id="top"><button id="menuBtn">☰</button><button id="retry">↻</button><button id="muteBtn">🔊</button></div>
+<div id="ui" class="overlay"><div id="box"><h1 id="msg"></h1><div id="stars"></div><div id="btns" class="row"></div></div></div>
+<div id="menu" class="overlay"><div id="mbox"><h1>스테이지</h1><div id="grid"></div></div></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/matter-js/0.19.0/matter.min.js"></script>
+<script>
+const {Engine, Bodies, Body, Bounds, Composite, Events, Query, Vector} = Matter;
+
+// tuning knobs
+const W = 600, H = 900;
+const INK_MAX = 900;      // px of line per level
+const SURVIVE = 10;       // seconds to survive
+const BEE_SPEED = 3.2;    // px per step
+const STEER = 0.07;       // 0..1, how hard bees turn toward a dog
+const LINE_W = 10;
+const SPAWN_MS = 110;
+const STEP = 1000 / 60;
+const CAT_BEE = 2, CAT_HIVE = 4;
+const BEE_R = 12;
+const BUOYANCY = 1.6;     // x gravity, upward, for bodies in water (line floats)
+
+// sprites (assets/game). Missing image -> falls back to shape drawing.
+const IMG = {};
+for (const k of ['dog_idle', 'dog_scared', 'dog_stung', 'bee_1', 'bee_2', 'hive', 'platform', 'spikes']) { IMG[k] = new Image(); IMG[k].src = `assets/game/${k}.png`; }
+IMG.bg = new Image(); IMG.bg.src = 'assets/game/bg.jpg';
+const ok = im => im && im.complete && im.naturalWidth > 0;
+const DOG_DRAW_W = {dog_idle: 100, dog_scared: 112, dog_stung: 104};
+
+// ---- levels ----
+// plats/spikes: [x, y, w, h, angle?] (center; spikes point up at angle 0), water: [x, y, w, h]
+// dog hitbox is 88x62: a dog standing on a surface whose top is T has center y = T - 31
+const G = [300, 880, 600, 80];            // full ground, top 840
+const GS = 809;                           // dog y on full ground
+const WATER = [300, 860, 600, 80];        // full-width water, surface 820
+const LEVELS = [
+  // ch1: bees only, more hives / bees
+  {dogs: [[300, GS]], hives: [[300, 160]], bees: 10, plats: [G]},
+  {dogs: [[150, GS]], hives: [[460, 180]], bees: 12, plats: [G]},
+  {dogs: [[300, GS]], hives: [[100, 160], [500, 160]], bees: 14, plats: [G]},
+  {dogs: [[450, GS]], hives: [[150, 520]], bees: 16, plats: [G]},
+  {dogs: [[300, GS]], hives: [[90, 140], [510, 140]], bees: 18, plats: [G, [300, 560, 200, 20]]},
+  {dogs: [[300, GS]], hives: [[100, 300], [500, 300], [300, 120]], bees: 20, plats: [G]},
+  // ch2: ledges, pillars, slopes - the line has to hold the dog up too
+  {dogs: [[300, 579]], hives: [[300, 150]], bees: 14, plats: [[300, 620, 120, 20]]},
+  {dogs: [[300, 609]], hives: [[480, 180]], bees: 16, plats: [[300, 770, 60, 260]]},
+  {dogs: [[300, 655]], hives: [[120, 160]], bees: 16, plats: [[300, 700, 260, 20, 0.25]]},
+  {dogs: [[150, 659]], hives: [[300, 200]], bees: 18, plats: [[100, 700, 200, 20], [500, 700, 200, 20]]},
+  {dogs: [[300, 379]], hives: [[300, 800]], bees: 18, plats: [[300, 420, 160, 20]]},
+  {dogs: [[480, 589]], hives: [[100, 200], [300, 140]], bees: 20, plats: [[150, 880, 300, 80], [450, 760, 300, 280]]},
+  // ch3: spikes
+  {dogs: [[300, GS]], hives: [[300, 150]], bees: 18, plats: [G], spikes: [[90, 825, 180, 30], [510, 825, 180, 30]]},
+  {dogs: [[300, 569]], hives: [[120, 180], [480, 180]], bees: 18, plats: [G, [300, 600, 160, 20]], spikes: [[300, 825, 600, 30]]},
+  {dogs: [[300, 609]], hives: [[500, 560]], bees: 20, plats: [G, [300, 640, 100, 20]], spikes: [[300, 825, 600, 30]]},
+  {dogs: [[300, GS]], hives: [[100, 300], [500, 300]], bees: 20, plats: [G, [300, 520, 240, 20]], spikes: [[300, 545, 240, 30, Math.PI]]},
+  {dogs: [[150, 569]], hives: [[480, 200]], bees: 20, plats: [G, [260, 650, 320, 20, 0.3]], spikes: [[500, 825, 200, 30]]},
+  {dogs: [[300, GS]], hives: [[60, 600], [540, 600]], bees: 22, plats: [G], spikes: [[60, 825, 120, 30], [540, 825, 120, 30]]},
+  // ch4: water - dog must stay dry, the line floats
+  {dogs: [[130, GS]], hives: [[450, 200]], bees: 18, plats: [[120, 880, 240, 80]], water: [[420, 875, 360, 50]]},
+  {dogs: [[300, 729]], hives: [[300, 150]], bees: 18, plats: [[300, 770, 140, 20]], water: [WATER]},
+  {dogs: [[200, 569]], hives: [[500, 500]], bees: 20, plats: [[200, 600, 160, 20]], water: [WATER]},
+  {dogs: [[450, 729]], hives: [[150, 200], [300, 120]], bees: 20, plats: [[150, 770, 140, 20], [450, 770, 140, 20]], water: [WATER]},
+  {dogs: [[300, 589]], hives: [[80, 160], [520, 160]], bees: 22, plats: [[300, 760, 60, 280]], water: [WATER]},
+  {dogs: [[300, GS]], hives: [[300, 140], [100, 400], [500, 400]], bees: 24, plats: [[300, 880, 200, 80], [500, 880, 200, 80]], spikes: [[500, 825, 200, 30]], water: [[100, 875, 200, 50]]},
+  // ch5: everything + two dogs
+  {dogs: [[150, GS], [450, GS]], hives: [[300, 150]], bees: 20, plats: [G]},
+  {dogs: [[150, GS], [450, 569]], hives: [[300, 140], [550, 300]], bees: 22, plats: [G, [450, 600, 160, 20]]},
+  {dogs: [[300, 569]], hives: [[80, 200], [520, 200]], bees: 24, plats: [[150, 880, 300, 80], [300, 600, 160, 20]], spikes: [[150, 825, 300, 30]], water: [[450, 875, 300, 50]]},
+  {dogs: [[150, 729], [450, 729]], hives: [[300, 140]], bees: 24, plats: [[150, 770, 140, 20], [450, 770, 140, 20]], water: [WATER]},
+  {dogs: [[300, 575]], hives: [[80, 500], [520, 500]], bees: 26, plats: [G, [300, 620, 300, 20, -0.25]], spikes: [[300, 825, 600, 30]]},
+  {dogs: [[220, GS], [470, 729]], hives: [[80, 200], [300, 120], [540, 300]], bees: 30, plats: [[150, 880, 300, 80], [470, 770, 120, 20]], spikes: [[60, 825, 120, 30]], water: [[450, 875, 300, 50]]},
+];
+
+// ---- save (best stars per level) ----
+const SAVE_KEY = 'buzzoff_v1';
+let best = {};
+try { best = JSON.parse(localStorage.getItem(SAVE_KEY)) || {}; } catch {}
+const saveBest = (i, s) => { best[i] = Math.max(best[i] || 0, s); try { localStorage.setItem(SAVE_KEY, JSON.stringify(best)); } catch {} };
+const unlocked = i => i === 0 || best[i - 1] > 0;
+const starsFor = used => used <= 1 / 3 ? 3 : used <= 2 / 3 ? 2 : 1; // less ink = more stars
+
+// ---- sound (assets/sfx) ----
+const SND = {};
+for (const k of ['bgm', 'scribble', 'drop', 'buzz', 'sting', 'splash', 'spike', 'win', 'lose', 'click']) SND[k] = new Audio(`assets/sfx/${k}.mp3`);
+SND.bgm.loop = SND.buzz.loop = SND.scribble.loop = true;
+const VOL = {bgm: 0.35, buzz: 0.4, scribble: 0.6}; // one-shots default to 0.8
+let muted = false;
+try { muted = localStorage.getItem('buzzoff_mute') === '1'; } catch {}
+function sfx(k) { if (muted || !k) return; const a = SND[k].cloneNode(); a.volume = VOL[k] ?? 0.8; a.play().catch(() => {}); }
+function loopOn(k, on) {
+  const a = SND[k];
+  if (on && !muted) { if (a.paused) { a.volume = VOL[k]; a.play().catch(() => {}); } }
+  else if (!a.paused) { a.pause(); if (k !== 'bgm') a.currentTime = 0; }
+}
+addEventListener('pointerdown', () => loopOn('bgm', true)); // browsers block autoplay until the first touch
+addEventListener('click', e => e.target.closest('button') && sfx('click'), true);
+
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const ui = document.getElementById('ui'), menu = document.getElementById('menu');
+
+function fit() {
+  const s = Math.min(innerWidth / W, innerHeight / H) * 0.96, dpr = devicePixelRatio || 1;
+  cv.style.width = W * s + 'px'; cv.style.height = H * s + 'px';
+  cv.width = W * dpr; cv.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+addEventListener('resize', fit); fit();
+
+let level = 0, engine, state, pts, ink, line, dogs, hives, plats, spikes, waters, bees, spawned, lastSpawn, tStart, drawing = false;
+
+function load(i) {
+  level = i; const L = LEVELS[i];
+  engine = Engine.create();
+  const rect = ([x, y, w, h, a = 0], o) => Object.assign(Bodies.rectangle(x, y, w, h, {isStatic: true, angle: a, ...o}), {w, h});
+  plats = L.plats.map(p => rect(p, {friction: 1}));
+  spikes = (L.spikes || []).map(p => rect(p, {label: 'spike'}));
+  waters = (L.water || []).map(p => rect(p, {label: 'water', isSensor: true}));
+  hives = L.hives.map(([x, y]) => Bodies.circle(x, y, 34, {isStatic: true, collisionFilter: {category: CAT_HIVE, mask: 1}}));
+  dogs = L.dogs.map(([x, y]) => Bodies.rectangle(x, y - 2, 88, 62, {label: 'dog', friction: 1, density: 0.002, chamfer: {radius: 26}}));
+  Composite.add(engine.world, [...plats, ...spikes, ...waters, ...hives, ...dogs]);
+  Events.on(engine, 'collisionStart', e => {
+    for (const p of e.pairs) {
+      const l = [p.bodyA.label, p.bodyB.label];
+      if (!l.includes('dog')) continue;
+      if (l.includes('bee')) end(false, 'sting');
+      else if (l.includes('spike')) end(false, 'spike');
+    }
+  });
+  Events.on(engine, 'beforeUpdate', () => { buoyancy(); steer(); });
+  state = 'draw'; pts = []; ink = INK_MAX; line = null; bees = []; spawned = 0; lastSpawn = 0; flow = null; flowTick = 0;
+  ui.style.display = menu.style.display = 'none';
+  loopOn('scribble', false);
+}
+
+const inWater = pos => waters.some(w => Bounds.contains(w.bounds, pos));
+
+function buoyancy() {
+  const g = engine.gravity;
+  for (const b of [line, ...dogs]) {
+    if (!b || !inWater(b.position)) continue;
+    Body.applyForce(b, b.position, {x: 0, y: -b.mass * g.y * g.scale * BUOYANCY});
+    Body.setVelocity(b, Vector.mult(b.velocity, 0.95));
+  }
+}
+
+// ---- bees: BFS distance field from all dogs over a coarse grid, rebuilt every few steps (line moves)
+const CELL = 20, GW = W / CELL, GH = H / CELL, PAD = BEE_R; // PAD ~ bee radius so paths keep clearance
+let flow = null, flowTick = 0;
+const cellOf = p => [Math.min(GW - 1, Math.max(0, Math.floor(p.x / CELL))), Math.min(GH - 1, Math.max(0, Math.floor(p.y / CELL)))];
+
+function buildFlow() {
+  const obs = [...plats, ...spikes, ...(line ? line.parts.slice(1) : [])];
+  const blocked = new Uint8Array(GW * GH);
+  for (let y = 0; y < GH; y++) for (let x = 0; x < GW; x++) {
+    const r = {min: {x: x * CELL - PAD, y: y * CELL - PAD}, max: {x: (x + 1) * CELL + PAD, y: (y + 1) * CELL + PAD}};
+    if (Query.region(obs, r).length) blocked[y * GW + x] = 1;
+  }
+  flow = new Float32Array(GW * GH).fill(Infinity);
+  const q = dogs.map(d => { const [x, y] = cellOf(d.position); return y * GW + x; });
+  q.forEach(i => flow[i] = 0);
+  for (let h = 0; h < q.length; h++) {
+    const i = q[h], x = i % GW, y = (i / GW) | 0;
+    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      const nx = x + dx, ny = y + dy, j = ny * GW + nx;
+      if (nx < 0 || ny < 0 || nx >= GW || ny >= GH || blocked[j] || flow[j] !== Infinity) continue;
+      flow[j] = flow[i] + 1; q.push(j);
+    }
+  }
+}
+
+// angle toward the lowest-distance neighbor cell, or null = no path (dog sealed in) -> fly straight
+function pathAngle(b) {
+  const cx = Math.floor(b.position.x / CELL), cy = Math.floor(b.position.y / CELL);
+  if (!flow || cx < 0 || cy < 0 || cx >= GW || cy >= GH) return null;
+  let bestD = flow[cy * GW + cx], tx = null, ty = null;
+  for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+    const nx = cx + dx, ny = cy + dy;
+    if (nx < 0 || ny < 0 || nx >= GW || ny >= GH || flow[ny * GW + nx] >= bestD) continue;
+    bestD = flow[ny * GW + nx]; tx = nx; ty = ny;
+  }
+  if (tx === null || bestD === Infinity) return null;
+  return Math.atan2((ty + .5) * CELL - b.position.y, (tx + .5) * CELL - b.position.x);
+}
+
+function steer() {
+  const g = engine.gravity, t = engine.timing.timestamp;
+  if (flowTick++ % 15 === 0) buildFlow();
+  for (const b of bees) {
+    Body.applyForce(b, b.position, {x: 0, y: -b.mass * g.y * g.scale}); // bees ignore gravity
+    let d = null;
+    for (const dog of dogs) { const v = Vector.sub(dog.position, b.position); if (!d || Vector.magnitude(v) < Vector.magnitude(d)) d = v; }
+    const near = Vector.magnitude(d) < CELL * 2; // last stretch: go straight for the dog
+    const p = near ? null : pathAngle(b);
+    // bias: each bee leans to its own side so they spread out instead of flying single file
+    const a = state === 'win' ? -Math.PI / 2 : p !== null ? p + b.bias + Math.sin(t * 0.004 + b.phase) * 0.4 : Math.atan2(d.y, d.x) + Math.sin(t * 0.004 + b.phase) * 0.9;
+    Body.setVelocity(b, {
+      x: b.velocity.x + (Math.cos(a) * BEE_SPEED - b.velocity.x) * STEER,
+      y: b.velocity.y + (Math.sin(a) * BEE_SPEED - b.velocity.y) * STEER,
+    });
+  }
+}
+
+function spawn(now) {
+  const L = LEVELS[level];
+  if (state !== 'play' || spawned >= L.bees || now - lastSpawn < SPAWN_MS) return;
+  const h = hives[spawned % hives.length];
+  const b = Bodies.circle(h.position.x + (Math.random() - .5) * 20, h.position.y + (Math.random() - .5) * 20, BEE_R, {
+    label: 'bee', density: 0.0004, frictionAir: 0.02, restitution: 0.6,
+    collisionFilter: {category: CAT_BEE, mask: 0xFFFFFFFF ^ CAT_HIVE},
+  });
+  b.phase = Math.random() * Math.PI * 2;
+  b.bias = (Math.random() * 2 - 1) * 0.5;
+  const a = Math.random() * Math.PI * 2;
+  Body.setVelocity(b, {x: Math.cos(a) * 4, y: Math.sin(a) * 4});
+  bees.push(b); Composite.add(engine.world, b);
+  spawned++; lastSpawn = now;
+}
+
+// ---- end / menus ----
+const LOSE_MSG = {sting: '쏘였다!', spike: '찔렸다!', water: '빠졌다!', fall: '떨어졌다!'};
+
+function button(text, fn) { const b = document.createElement('button'); b.textContent = text; b.onclick = fn; return b; }
+function starImgs(n) {
+  return [0, 1, 2].map(i => { const im = new Image(); im.src = `assets/game/${i < n ? 'star' : 'star_empty'}.png`; im.alt = i < n ? '★' : '☆'; return im; });
+}
+
+function end(won, why) {
+  if (state !== 'play') return;
+  state = won ? 'win' : 'lose';
+  const last = level === LEVELS.length - 1, stars = starsFor(1 - ink / INK_MAX);
+  if (won) saveBest(level, stars);
+  if (won) sfx('win');
+  else { sfx({sting: 'sting', spike: 'spike', water: 'splash'}[why]); setTimeout(() => sfx('lose'), 450); }
+  setTimeout(() => {
+    document.getElementById('msg').textContent = won ? (last ? '전부 클리어!' : '구했다!') : LOSE_MSG[why];
+    document.getElementById('stars').replaceChildren(...(won ? starImgs(stars) : []));
+    document.getElementById('btns').replaceChildren(
+      won ? button(last ? '처음부터' : '다음', () => load(last ? 0 : level + 1)) : button('다시', () => load(level)),
+      button('메뉴', showMenu));
+    ui.style.display = 'flex';
+  }, 700);
+}
+
+function showMenu() {
+  const grid = document.getElementById('grid');
+  grid.replaceChildren(...LEVELS.map((_, i) => {
+    const b = button('', () => load(i));
+    b.disabled = !unlocked(i);
+    const label = document.createElement('span'); label.textContent = i + 1;
+    const sub = document.createElement('span');
+    if (b.disabled) { const lk = new Image(); lk.src = 'assets/game/lock.png'; lk.className = 'lock'; lk.alt = '🔒'; sub.append(lk); }
+    else sub.append(...starImgs(best[i] || 0));
+    b.append(label, sub);
+    return b;
+  }));
+  ui.style.display = 'none'; menu.style.display = 'flex';
+}
+
+// ---- drawing the line ----
+const toWorld = e => { const r = cv.getBoundingClientRect(); return {x: (e.clientX - r.left) * W / r.width, y: (e.clientY - r.top) * H / r.height}; };
+const solids = () => Composite.allBodies(engine.world).filter(b => !b.isSensor); // can draw over water
+const blocked = p => p.x < 0 || p.y < 0 || p.x > W || p.y > H || Query.point(solids(), p).length > 0;
+
+cv.onpointerdown = e => {
+  if (state !== 'draw' || pts.length) return;
+  const p = toWorld(e); if (blocked(p)) return;
+  pts = [p]; drawing = true; cv.setPointerCapture(e.pointerId);
+  loopOn('scribble', true);
+};
+cv.onpointermove = e => {
+  if (!drawing) return;
+  const p = toWorld(e), last = pts[pts.length - 1], d = Vector.magnitude(Vector.sub(p, last));
+  if (d < 6 || d > ink || blocked(p) || Query.ray(solids(), last, p, LINE_W).length) return;
+  pts.push(p); ink -= d;
+};
+cv.onpointerup = cv.onpointercancel = () => {
+  if (!drawing) return; drawing = false;
+  loopOn('scribble', false);
+  if (pts.length < 2) { pts = []; return; }
+  sfx('drop');
+  const parts = [];
+  for (let i = 1; i < pts.length; i++) {
+    const a = pts[i - 1], b = pts[i];
+    parts.push(Bodies.rectangle((a.x + b.x) / 2, (a.y + b.y) / 2, Vector.magnitude(Vector.sub(b, a)), LINE_W, {angle: Math.atan2(b.y - a.y, b.x - a.x)}));
+  }
+  line = Body.create({parts, friction: 0.8});
+  line.local = pts.map(p => Vector.sub(p, line.position));
+  Composite.add(engine.world, line);
+  state = 'play'; tStart = performance.now();
+};
+document.getElementById('retry').onclick = () => load(level);
+document.getElementById('menuBtn').onclick = showMenu;
+const muteBtn = document.getElementById('muteBtn');
+muteBtn.textContent = muted ? '🔇' : '🔊';
+muteBtn.onclick = () => {
+  muted = !muted; muteBtn.textContent = muted ? '🔇' : '🔊';
+  try { localStorage.setItem('buzzoff_mute', muted ? '1' : '0'); } catch {}
+  if (muted) for (const k of ['bgm', 'buzz', 'scribble']) loopOn(k, false);
+};
+addEventListener('keydown', e => e.key === 'r' && load(level));
+
+// ---- render ----
+function poly(vs) { ctx.beginPath(); vs.forEach((v, i) => i ? ctx.lineTo(v.x, v.y) : ctx.moveTo(v.x, v.y)); ctx.closePath(); }
+
+function stroke(points) {
+  ctx.lineWidth = LINE_W; ctx.lineCap = ctx.lineJoin = 'round'; ctx.strokeStyle = '#7a5240';
+  ctx.beginPath(); points.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)); ctx.stroke();
+}
+
+function sprite(im, w, x, y, anchorBottom) {
+  const h = w * im.naturalHeight / im.naturalWidth;
+  ctx.drawImage(im, x - w / 2, anchorBottom ? y - h : y - h / 2, w, h);
+}
+
+// run fn in the body's local frame (origin at center, unrotated)
+function local(b, fn) { ctx.save(); ctx.translate(b.position.x, b.position.y); ctx.rotate(b.angle); fn(b.w, b.h); ctx.restore(); }
+
+function drawPlat(p) {
+  local(p, (w, h) => {
+    if (ok(IMG.platform)) { const lift = h * 0.15; ctx.drawImage(IMG.platform, -w / 2, -h / 2 - lift, w, h + lift); return; }
+    ctx.fillStyle = '#8a5a34'; ctx.fillRect(-w / 2, -h / 2, w, h); ctx.fillStyle = '#5fbf4a'; ctx.fillRect(-w / 2, -h / 2, w, 8);
+  });
+}
+
+function drawSpikes(s) {
+  local(s, (w, h) => {
+    if (ok(IMG.spikes)) {
+      const n = Math.max(1, Math.round(w / (h * IMG.spikes.naturalWidth / IMG.spikes.naturalHeight)));
+      for (let i = 0; i < n; i++) ctx.drawImage(IMG.spikes, -w / 2 + i * w / n, -h / 2, w / n, h);
+      return;
+    }
+    ctx.fillStyle = '#d0505a'; ctx.beginPath();
+    const n = Math.max(1, Math.round(w / 24));
+    for (let i = 0; i < n; i++) { const x = -w / 2 + i * w / n; ctx.moveTo(x, h / 2); ctx.lineTo(x + w / n / 2, -h / 2); ctx.lineTo(x + w / n, h / 2); }
+    ctx.fill();
+  });
+}
+
+function drawWater(wb, t) {
+  const {min, max} = wb.bounds;
+  const g = ctx.createLinearGradient(0, min.y, 0, max.y);
+  g.addColorStop(0, '#8fd3f4cc'); g.addColorStop(1, '#4f9fd8dd');
+  ctx.fillStyle = g; ctx.beginPath(); ctx.moveTo(min.x, max.y);
+  for (let x = min.x; x <= max.x; x += 10) ctx.lineTo(x, min.y + Math.sin(x * 0.05 + t * 0.003) * 3);
+  ctx.lineTo(max.x, max.y); ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = '#ffffffaa'; ctx.lineWidth = 3; ctx.beginPath();
+  for (let x = min.x; x <= max.x; x += 10) ctx.lineTo(x, min.y + Math.sin(x * 0.05 + t * 0.003) * 3);
+  ctx.stroke();
+}
+
+function drawDog(dog) {
+  const near = bees.some(b => Vector.magnitude(Vector.sub(b.position, dog.position)) < 170);
+  const k = state === 'lose' ? 'dog_stung' : state === 'play' && near ? 'dog_scared' : 'dog_idle';
+  ctx.save(); ctx.translate(dog.position.x, dog.position.y); ctx.rotate(dog.angle);
+  if (ok(IMG[k])) {
+    if (k === 'dog_scared') ctx.translate(Math.sin(performance.now() * 0.08) * 1.5, 0); // tremble
+    sprite(IMG[k], DOG_DRAW_W[k], 0, 33, true); // 33 ~ hitbox half-height, feet on the ground
+  } else {
+    ctx.fillStyle = '#f3d9c4'; ctx.beginPath(); ctx.roundRect(-44, -31, 88, 62, 26); ctx.fill();
+    ctx.fillStyle = '#5a3a2a';
+    for (const x of [-14, 14]) { ctx.beginPath(); ctx.arc(x, -6, 4.5, 0, 7); ctx.fill(); }
+  }
+  ctx.restore();
+}
+
+function drawHive(h) {
+  const {x, y} = h.position;
+  if (ok(IMG.hive)) return sprite(IMG.hive, 86, x, y);
+  ctx.fillStyle = '#d98c1e'; ctx.beginPath(); ctx.arc(x, y, 34, 0, 7); ctx.fill();
+  ctx.fillStyle = '#3a2410'; ctx.beginPath(); ctx.ellipse(x, y + 8, 7, 6, 0, 0, 7); ctx.fill();
+}
+
+function drawBee(b, t) {
+  const im = IMG[Math.floor(t / 70 + b.phase) % 2 ? 'bee_2' : 'bee_1'];
+  ctx.save(); ctx.translate(b.position.x, b.position.y);
+  if (ok(im)) {
+    if (b.velocity.x < 0) ctx.scale(-1, 1); // sprite faces right
+    sprite(im, 34, 0, 0);
+  } else {
+    ctx.fillStyle = '#ffd21f'; ctx.beginPath(); ctx.arc(0, 0, BEE_R, 0, 7); ctx.fill();
+  }
+  ctx.restore();
+}
+
+function render(now) {
+  ctx.clearRect(0, 0, W, H);
+  if (ok(IMG.bg)) ctx.drawImage(IMG.bg, 0, 0, W, H);
+  plats.forEach(drawPlat);
+  spikes.forEach(drawSpikes);
+  hives.forEach(drawHive);
+  if (line) {
+    ctx.save(); ctx.translate(line.position.x, line.position.y); ctx.rotate(line.angle); stroke(line.local); ctx.restore();
+  } else if (pts.length) stroke(pts);
+  dogs.forEach(drawDog);
+  waters.forEach(w => drawWater(w, now)); // on top: things in water look submerged
+  bees.forEach(b => drawBee(b, now));
+
+  ctx.fillStyle = '#7a5240'; ctx.font = '700 22px system-ui'; ctx.textAlign = 'right';
+  ctx.fillText(`${level + 1} / ${LEVELS.length}`, W - 16, 34);
+  ctx.textAlign = 'center';
+  if (state === 'draw') {
+    ctx.fillStyle = '#0002'; ctx.fillRect(150, 20, 300, 16);
+    ctx.fillStyle = '#7a5240'; ctx.fillRect(150, 20, 300 * ink / INK_MAX, 16);
+    ctx.fillStyle = '#ffffffcc'; // star thresholds: stay right of a mark to keep that star
+    for (const f of [1 / 3, 2 / 3]) ctx.fillRect(150 + 300 * f - 1, 16, 3, 24);
+    ctx.fillStyle = '#7a5240'; ctx.fillText('선을 그어 강아지를 지켜!', W / 2, 68);
+  } else if (state === 'play') {
+    ctx.font = '800 56px system-ui';
+    ctx.fillText(Math.min(SURVIVE, Math.max(0, Math.ceil(SURVIVE - (now - tStart) / 1000))), W / 2, 70);
+  }
+}
+
+// lose checks that aren't collisions
+function checkDogs() {
+  for (const d of dogs) {
+    if (inWater(d.position)) return end(false, 'water');
+    const {x, y} = d.position;
+    if (y > H + 80 || x < -100 || x > W + 100) return end(false, 'fall');
+  }
+}
+
+let acc = 0, last = performance.now();
+function frame(now) {
+  if (state !== 'draw') {
+    acc += Math.min(now - last, 100);
+    while (acc >= STEP) { spawn(now); Engine.update(engine, STEP); acc -= STEP; }
+  }
+  last = now;
+  if (state === 'play') {
+    checkDogs();
+    if (state === 'play' && now - tStart >= SURVIVE * 1000) end(true);
+  }
+  loopOn('buzz', state === 'play' && bees.length > 0);
+  if (!SND.buzz.paused) SND.buzz.volume = Math.min(0.6, 0.15 + bees.length * 0.02); // louder swarm = more bees
+  render(now);
+  requestAnimationFrame(frame);
+}
+
+load(0);
+showMenu();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
